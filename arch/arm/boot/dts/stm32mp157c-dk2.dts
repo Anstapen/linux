@@ -145,3 +145,14 @@
 		max-speed = <3000000>;
 	};
 };
+
+/* These are some custom devices, connected via breadboard*/
+
+&i2c5 {
+
+	pressure@60 {
+		compatible = "fsl,mpl3115";
+		reg = <0x60>;
+	};
+
+};
