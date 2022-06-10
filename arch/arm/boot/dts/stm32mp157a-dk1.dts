@@ -460,7 +460,7 @@
 	pinctrl-1 = <&i2c5_pins_sleep_a>;
 	/delete-property/dmas;
 	/delete-property/dma-names;
-	status = "disabled";
+	status = "okay";
 };
 
 &i2s2 {
