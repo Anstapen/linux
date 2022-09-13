@@ -893,6 +893,13 @@ error:
 	return ret;
 }
 
+static void stm32_dma_sg_inc(struct stm32_dma_chan *chan)
+{
+	chan->next_sg++;
+	if (chan->desc->cyclic && (chan->next_sg == chan->desc->num_sgs))
+		chan->next_sg = 0;
+}
+
 static void stm32_dma_configure_next_sg(struct stm32_dma_chan *chan)
 {
 	struct stm32_dma_device *dmadev = stm32_dma_get_dev(chan);
@@ -901,9 +908,6 @@ static void stm32_dma_configure_next_sg(struct stm32_dma_chan *chan)
 
 	id = chan->id;
 	dma_scr = stm32_dma_read(dmadev, STM32_DMA_SCR(id));
-
-	if (chan->next_sg == chan->desc->num_sgs)
-		chan->next_sg = 0;
 
 	sg_req = &chan->desc->sg_req[chan->next_sg];
 
@@ -1003,7 +1007,7 @@ static void stm32_dma_start_transfer(struct stm32_dma_chan *chan)
 		}
 	}
 
-	chan->next_sg++;
+	stm32_dma_sg_inc(chan);
 
 	reg->dma_scr &= ~STM32_DMA_SCR_EN;
 	stm32_dma_write(dmadev, STM32_DMA_SCR(chan->id), reg->dma_scr);
@@ -1030,12 +1034,13 @@ static void stm32_dma_start_transfer(struct stm32_dma_chan *chan)
 static void stm32_dma_handle_chan_paused(struct stm32_dma_chan *chan)
 {
 	struct stm32_dma_device *dmadev = stm32_dma_get_dev(chan);
+	u32 dma_scr;
 
 	/*
 	 * Read and store current remaining data items and peripheral/memory addresses to be
 	 * updated on resume
 	 */
-	chan->chan_reg.dma_scr = stm32_dma_read(dmadev, STM32_DMA_SCR(chan->id));
+	dma_scr = stm32_dma_read(dmadev, STM32_DMA_SCR(chan->id));
 	/*
 	 * Transfer can be paused while between a previous resume and reconfiguration on transfer
 	 * complete. If transfer is cyclic and CIRC and DBM have been deactivated for resume, need
@@ -1043,11 +1048,24 @@ static void stm32_dma_handle_chan_paused(struct stm32_dma_chan *chan)
 	 */
 	if (chan->desc && chan->desc->cyclic) {
 		if (chan->desc->num_sgs == 1)
-			chan->chan_reg.dma_scr |= STM32_DMA_SCR_CIRC;
+			dma_scr |= STM32_DMA_SCR_CIRC;
 		else
-			chan->chan_reg.dma_scr |= STM32_DMA_SCR_DBM;
+			dma_scr |= STM32_DMA_SCR_DBM;
 	}
+	chan->chan_reg.dma_scr = dma_scr;
+
+	/*
+	 * Need to temporarily deactivate CIRC/DBM until next Transfer Complete interrupt, otherwise
+	 * on resume NDTR autoreload value will be wrong (lower than the initial period length)
+	 */
+	if (chan->desc && chan->desc->cyclic) {
+		dma_scr &= ~(STM32_DMA_SCR_DBM | STM32_DMA_SCR_CIRC);
+		stm32_dma_write(dmadev, STM32_DMA_SCR(chan->id), dma_scr);
+	}
+
 	chan->chan_reg.dma_sndtr = stm32_dma_read(dmadev, STM32_DMA_SNDTR(chan->id));
+
+	chan->status = DMA_PAUSED;
 
 	dev_dbg(chan2dev(chan), "vchan %pK: paused\n", &chan->vchan);
 }
@@ -1113,7 +1131,7 @@ static void stm32_dma_handle_chan_done(struct stm32_dma_chan *chan, u32 scr)
 		vchan_cyclic_callback(&chan->desc->vdesc);
 		if (chan->use_mdma)
 			return;
-		chan->next_sg++;
+		stm32_dma_sg_inc(chan);
 		/* cyclic while CIRC/DBM disable => post resume reconfiguration needed */
 		if (!(scr & (STM32_DMA_SCR_CIRC | STM32_DMA_SCR_DBM)))
 			stm32_dma_post_resume_reconfigure(chan);
@@ -1166,9 +1184,7 @@ static irqreturn_t stm32_dma_chan_irq(int irq, void *devid)
 	if (status & STM32_DMA_TCI) {
 		stm32_dma_irq_clear(chan, STM32_DMA_TCI);
 		if (scr & STM32_DMA_SCR_TCIE) {
-			if (chan->status == DMA_PAUSED)
-				stm32_dma_handle_chan_paused(chan);
-			else
+			if (chan->status != DMA_PAUSED)
 				stm32_dma_handle_chan_done(chan, scr);
 		}
 		status &= ~STM32_DMA_TCI;
@@ -1221,13 +1237,11 @@ static int stm32_dma_pause(struct dma_chan *c)
 		return -EPERM;
 
 	spin_lock_irqsave(&chan->vchan.lock, flags);
+
 	ret = stm32_dma_disable_chan(chan);
-	/*
-	 * A transfer complete flag is set to indicate the end of transfer due to the stream
-	 * interruption, so wait for interrupt
-	 */
 	if (!ret)
-		chan->status = DMA_PAUSED;
+		stm32_dma_handle_chan_paused(chan);
+
 	spin_unlock_irqrestore(&chan->vchan.lock, flags);
 
 	return ret;
@@ -1290,12 +1304,13 @@ static int stm32_dma_resume(struct dma_chan *c)
 
 	/*
 	 * Need to temporarily deactivate CIRC/DBM until next Transfer Complete interrupt,
-	 * otherwise NDTR autoreload value will be wrong (lower than the initial period length
+	 * otherwise NDTR autoreload value will be wrong (lower than the initial period length)
 	 */
-	if (chan_reg.dma_scr & (STM32_DMA_SCR_CIRC | STM32_DMA_SCR_DBM)) {
+	if (chan_reg.dma_scr & (STM32_DMA_SCR_CIRC | STM32_DMA_SCR_DBM))
 		chan_reg.dma_scr &= ~(STM32_DMA_SCR_CIRC | STM32_DMA_SCR_DBM);
-		stm32_dma_write(dmadev, STM32_DMA_SCR(id), chan_reg.dma_scr);
-	}
+
+	if (chan_reg.dma_scr & STM32_DMA_SCR_DBM)
+		stm32_dma_configure_next_sg(chan);
 
 	stm32_dma_dump_reg(chan);
 
@@ -1821,10 +1836,12 @@ static struct dma_async_tx_descriptor *stm32_dma_prep_dma_cyclic(
 	}
 
 	/*  Enable Circular mode or double buffer mode */
-	if (buf_len == period_len)
+	if (buf_len == period_len) {
 		chan->chan_reg.dma_scr |= STM32_DMA_SCR_CIRC;
-	else
+	} else {
 		chan->chan_reg.dma_scr |= STM32_DMA_SCR_DBM;
+		chan->chan_reg.dma_scr &= ~STM32_DMA_SCR_CT;
+	}
 
 	/* Clear periph ctrl if client set it */
 	chan->chan_reg.dma_scr &= ~STM32_DMA_SCR_PFCTRL;
@@ -1943,24 +1960,36 @@ static bool stm32_dma_is_current_sg(struct stm32_dma_chan *chan)
 {
 	struct stm32_dma_device *dmadev = stm32_dma_get_dev(chan);
 	struct stm32_dma_sg_req *sg_req;
-	u32 dma_scr, dma_smar, id;
+	u32 dma_scr, dma_smar, id, period_len;
 
 	id = chan->id;
 	dma_scr = stm32_dma_read(dmadev, STM32_DMA_SCR(id));
 
+	/* In cyclic CIRC but not DBM, CT is not used */
 	if (!(dma_scr & STM32_DMA_SCR_DBM))
 		return true;
 
 	sg_req = &chan->desc->sg_req[chan->next_sg];
+	period_len = sg_dma_len(&sg_req->stm32_sgl_req);
 
+	/* DBM - take care of a previous pause/resume not yet post reconfigured */
 	if (dma_scr & STM32_DMA_SCR_CT) {
 		dma_smar = stm32_dma_read(dmadev, STM32_DMA_SM0AR(id));
-		return (dma_smar == sg_req->chan_reg.dma_sm0ar);
+		/*
+		 * If transfer has been pause/resumed,
+		 * SM0AR is in the range of [SM0AR:SM0AR+period_len]
+		 */
+		return (dma_smar >= sg_req->chan_reg.dma_sm0ar &&
+			dma_smar < sg_req->chan_reg.dma_sm0ar + period_len);
 	}
 
 	dma_smar = stm32_dma_read(dmadev, STM32_DMA_SM1AR(id));
-
-	return (dma_smar == sg_req->chan_reg.dma_sm1ar);
+	/*
+	 * If transfer has been pause/resumed,
+	 * SM1AR is in the range of [SM1AR:SM1AR+period_len]
+	 */
+	return (dma_smar >= sg_req->chan_reg.dma_sm1ar &&
+		dma_smar < sg_req->chan_reg.dma_sm1ar + period_len);
 }
 
 static size_t stm32_dma_desc_residue(struct stm32_dma_chan *chan,
@@ -2004,7 +2033,7 @@ static size_t stm32_dma_desc_residue(struct stm32_dma_chan *chan,
 
 	residue = stm32_dma_get_remaining_bytes(chan);
 
-	if (!stm32_dma_is_current_sg(chan)) {
+	if (chan->desc->cyclic && !stm32_dma_is_current_sg(chan)) {
 		n_sg++;
 		if (n_sg == chan->desc->num_sgs)
 			n_sg = 0;

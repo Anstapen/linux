@@ -447,9 +447,9 @@ static void stm32_cryp_write_ccm_first_header(struct stm32_cryp *cryp)
 		/* Build the two first u32 of B1 */
 		b8[0] = 0xFF;
 		b8[1] = 0xFE;
-		b8[2] = alen & 0xFF000000;
-		b8[3] = alen & 0x00FF0000;
-		b8[4] = alen & 0x0000FF00;
+		b8[2] = (alen & 0xFF000000) >> 24;
+		b8[3] = (alen & 0x00FF0000) >> 16;
+		b8[4] = (alen & 0x0000FF00) >> 8;
 		b8[5] = alen & 0x000000FF;
 		len = 6;
 	}
@@ -464,7 +464,6 @@ static void stm32_cryp_write_ccm_first_header(struct stm32_cryp *cryp)
 
 	stm32_crypt_gcmccm_end_header(cryp);
 }
-
 
 static int stm32_cryp_ccm_init(struct stm32_cryp *cryp, u32 cfg)
 {
@@ -535,7 +534,8 @@ static int stm32_cryp_hw_init(struct stm32_cryp *cryp)
 {
 	int ret;
 	u32 cfg, hw_mode;
-	pm_runtime_resume_and_get(cryp->dev);
+
+	pm_runtime_get_sync(cryp->dev);
 
 	/* Disable interrupt */
 	stm32_cryp_write(cryp, CRYP_IMSCR, 0);
@@ -633,10 +633,8 @@ static void stm32_cryp_finish_req(struct stm32_cryp *cryp, int err)
 		/* Phase 4 : output tag */
 		err = stm32_cryp_read_auth_tag(cryp);
 
-	if (!err && (!(is_gcm(cryp) || is_ccm(cryp))))
+	if (!err && (!(is_gcm(cryp) || is_ccm(cryp) || is_ecb(cryp))))
 		stm32_cryp_get_iv(cryp);
-
-	memset(cryp->ctx->key, 0, sizeof(cryp->ctx->key));
 
 	pm_runtime_mark_last_busy(cryp->dev);
 	pm_runtime_put_autosuspend(cryp->dev);
@@ -1062,7 +1060,6 @@ static int stm32_cryp_prepare_req(struct skcipher_request *req,
 		}
 	}
 
-
 	in_sg = req ? req->src : areq->src;
 	scatterwalk_start(&cryp->in_walk, in_sg);
 
@@ -1071,8 +1068,7 @@ static int stm32_cryp_prepare_req(struct skcipher_request *req,
 
 	if (is_gcm(cryp) || is_ccm(cryp)) {
 		/* In output, jump after assoc data */
-		scatterwalk_copychunks(NULL, &cryp->out_walk,
-				       cryp->areq->assoclen, 2);
+		scatterwalk_copychunks(NULL, &cryp->out_walk, cryp->areq->assoclen, 2);
 	}
 
 	if (is_ctr(cryp))
@@ -1224,14 +1220,12 @@ static void stm32_cryp_check_ctr_counter(struct stm32_cryp *cryp)
 {
 	u32 cr;
 
-	if (unlikely(cryp->last_ctr[3] == 0xFFFFFFFF)) {
-		cryp->last_ctr[3] = 0;
-		cryp->last_ctr[2] = cpu_to_be32(be32_to_cpu(cryp->last_ctr[2]) + 1);
-		if (!cryp->last_ctr[2]) {
-			cryp->last_ctr[1] = cpu_to_be32(be32_to_cpu(cryp->last_ctr[1]) + 1);
-			if (!cryp->last_ctr[1])
-				cryp->last_ctr[0] = cpu_to_be32(be32_to_cpu(cryp->last_ctr[0]) + 1);
-		}
+	if (unlikely(cryp->last_ctr[3] == cpu_to_be32(0xFFFFFFFF))) {
+		/*
+		 * In this case, we need to increment manually the ctr counter,
+		 * as HW doesn't handle the U32 carry.
+		 */
+		crypto_inc((u8 *)cryp->last_ctr, sizeof(cryp->last_ctr));
 
 		cr = stm32_cryp_read(cryp, CRYP_CR);
 		stm32_cryp_write(cryp, CRYP_CR, cr & ~CR_CRYPEN);
@@ -1256,10 +1250,8 @@ static void stm32_cryp_irq_read_data(struct stm32_cryp *cryp)
 	for (i = 0; i < cryp->hw_blocksize / sizeof(u32); i++)
 		block[i] = stm32_cryp_read(cryp, CRYP_DOUT);
 
-	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t,
-							     cryp->hw_blocksize,
-							     cryp->payload_out),
-			       1);
+	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t, cryp->hw_blocksize,
+							     cryp->payload_out), 1);
 	cryp->payload_out -= min_t(size_t, cryp->hw_blocksize,
 				   cryp->payload_out);
 }
@@ -1269,10 +1261,8 @@ static void stm32_cryp_irq_write_block(struct stm32_cryp *cryp)
 	unsigned int i;
 	u32 block[AES_BLOCK_32] = {0};
 
-	scatterwalk_copychunks(block, &cryp->in_walk, min_t(size_t,
-							    cryp->hw_blocksize,
-							    cryp->payload_in),
-			       0);
+	scatterwalk_copychunks(block, &cryp->in_walk, min_t(size_t, cryp->hw_blocksize,
+							    cryp->payload_in), 0);
 	for (i = 0; i < cryp->hw_blocksize / sizeof(u32); i++)
 		stm32_cryp_write(cryp, CRYP_DIN, block[i]);
 
@@ -1322,10 +1312,8 @@ static void stm32_cryp_irq_write_gcm_padded_data(struct stm32_cryp *cryp)
 	for (i = 0; i < cryp->hw_blocksize / sizeof(u32); i++)
 		block[i] = stm32_cryp_read(cryp, CRYP_DOUT);
 
-	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t,
-							     cryp->hw_blocksize,
-							     cryp->payload_out),
-			       1);
+	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t, cryp->hw_blocksize,
+							     cryp->payload_out), 1);
 	cryp->payload_out -= min_t(size_t, cryp->hw_blocksize,
 				   cryp->payload_out);
 
@@ -1424,12 +1412,9 @@ static void stm32_cryp_irq_write_ccm_padded_data(struct stm32_cryp *cryp)
 	for (i = 0; i < cryp->hw_blocksize / sizeof(u32); i++)
 		block[i] = stm32_cryp_read(cryp, CRYP_DOUT);
 
-	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t,
-							     cryp->hw_blocksize,
-							     cryp->payload_out),
-			       1);
-	cryp->payload_out -= min_t(size_t, cryp->hw_blocksize,
-				   cryp->payload_out);
+	scatterwalk_copychunks(block, &cryp->out_walk, min_t(size_t, cryp->hw_blocksize,
+							     cryp->payload_out), 1);
+	cryp->payload_out -= min_t(size_t, cryp->hw_blocksize, cryp->payload_out);
 
 	/* d) Load again CRYP_CSGCMCCMxR */
 	for (i = 0; i < ARRAY_SIZE(cstmp2); i++)
@@ -1524,7 +1509,6 @@ static irqreturn_t stm32_cryp_irq_thread(int irq, void *arg)
 	struct stm32_cryp *cryp = arg;
 	u32 ph;
 	u32 it_mask = stm32_cryp_read(cryp, CRYP_IMSCR);
-
 
 	if (cryp->irq_status & MISR_OUT)
 		/* Output FIFO IRQ: read data */
