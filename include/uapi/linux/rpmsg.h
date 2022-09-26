@@ -11,17 +11,6 @@
 
 #define RPMSG_ADDR_ANY		0xFFFFFFFF
 
-/**
- * struct rpmsg_endpoint_info - endpoint info representation
- * @name: name of service
- * @src: local address. To set to RPMSG_ADDR_ANY if not used.
- * @dst: destination address. To set to RPMSG_ADDR_ANY if not used.
- */
-struct rpmsg_endpoint_info {
-	char name[32];
-	__u32 src;
-	__u32 dst;
-};
 
 /**
  * Instantiate a new rmpsg char device endpoint.
